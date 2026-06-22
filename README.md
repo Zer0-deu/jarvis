@@ -37,11 +37,15 @@ Without these, the welcome speech is skipped (other actions may still run).
 | `CHROME_NEW_WINDOW_WAIT_S` | Seconds to wait for a new Chrome window on Windows (default `25`). |
 | `CHROME_WINDOW_WIDTH` / `CHROME_WINDOW_HEIGHT` | Windowed Chrome size when not fullscreen. |
 
+| `GROQ_API_KEY` | Groq API key to use a Groq-compatible endpoint (alias: `XAI_API_KEY`). |
+| `GROQ_API_URL` | (Optional) Groq endpoint URL (alias: `XAI_API_URL`) — not required; a sensible default is used when only a key is provided. |
+
 Example `.env`:
 
 ```env
 ELEVENLABS_API_KEY=your_key_here
 ELEVENLABS_VOICE_ID=your_voice_id_here
+GROQ_API_KEY=your_groq_key_here
 ```
 
 ## Run

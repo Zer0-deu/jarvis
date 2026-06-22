@@ -42,19 +42,26 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import wave
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 import numpy as np
 import sounddevice as sd
+import requests
+import random
+import speech_recognition as sr
+import http.server
 
 # --- tuning knobs -----------------------------------------------------------
 SAMPLE_RATE = 44100
@@ -78,31 +85,36 @@ INPUT_SILENT_RMS = 0.001
 SONG_URI = "https://open.spotify.com/track/39shmbIHICJ2Wxnk1fPSdz?si=2900c75c2e2d4b82"
 
 # Cursor: focus existing instance (no -n). Set OPEN_NEW_CURSOR_ON_DOUBLE_CLAP for a new window as well.
-FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP = True
+FOCUS_EXISTING_CURSOR_ON_DOUBLE_CLAP = False
 OPEN_NEW_CURSOR_ON_DOUBLE_CLAP = False
 CURSOR_OPEN_FULLSCREEN = True
 
 # Google Chrome (fallback: default browser). URLs overridable in .env.
-OPEN_CLAUDE_CODE_IN_CHROME = True
-OPEN_BINANCE_BTC_IN_CHROME = True
-OPEN_CHROME_FULLSCREEN = True
+OPEN_CLAUDE_CODE_IN_CHROME = False
+OPEN_BINANCE_BTC_IN_CHROME = False
+OPEN_CHROME_FULLSCREEN = False
 # False = default Chrome profile (your normal user, extensions, cookies). True = temp dirs under %TEMP% per site.
 CHROME_SEPARATE_SITE_PROFILES = False
 # Which physical screen (1 = leftmost/top-first after sorting). Windows only; ignored elsewhere.
 CLAUDE_CHROME_MONITOR = 1
-BINANCE_CHROME_MONITOR = 3
+BINANCE_CHROME_MONITOR = 1
 
 JARVIS_WELCOME_ENABLED = True
-JARVIS_WELCOME_PHRASE = (
-    "Welcome home sir. "
-    "Congratulations on the new client for your SaaS app—make sure to follow up. "
-    "If it helps: a short, specific note while the deal is still fresh usually "
-    "anchors trust better than a polished deck sent cold a few days later."
-)
-# Seconds after launching SONG_URI before speaking (gives Spotify/browser time to start).
-JARVIS_AFTER_SONG_DELAY_S = 1.0
+JARVIS_WELCOME_PHRASE = "Greetings sir,welcome back..how have you been"
+# Seconds after launching SONG_URI before speaking (gives Spotify/browser time to prepare).
+JARVIS_AFTER_SONG_DELAY_S = 3.0
+JARVIS_SONG_PLAYBACK_DELAY_S = 0.5
+# Voice command recording settings.
+JARVIS_VOICE_COMMAND_MAX_S = 8.0
+JARVIS_VOICE_COMMAND_BLOCK_MS = 120
+JARVIS_VOICE_COMMAND_SILENCE_THRESHOLD = 0.02
+JARVIS_VOICE_COMMAND_END_S = 1.0
+JARVIS_WAKEWORD_ENABLED = False
+JARVIS_WAKEWORD = "jarvis"
 # Save ElevenLabs PCM as WAV under .cache/jarvis_welcome/; replay skips the API when the key matches.
 JARVIS_WELCOME_CACHE_ENABLED = True
+JARVIS_AGENT_ENABLED = True
+JARVIS_VOICE_AGENT_ENABLED = True
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -112,6 +124,568 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("clap_listen")
+
+
+def _post_with_retries(url: str, *, json=None, headers=None, timeout: int = 10, max_retries: int = 4, backoff_factor: float = 1.0):
+    """POST with retries for 429 / 5xx and transient network errors.
+    Honors `Retry-After` header when present. Raises the final exception on failure.
+    Returns a `requests.Response` on success.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url, json=json, headers=headers, timeout=timeout)
+            # If rate limited or server error, consider retrying
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                ra = resp.headers.get("Retry-After")
+                try:
+                    wait = float(ra) if ra is not None else backoff_factor * (2 ** (attempt - 1))
+                except Exception:
+                    wait = backoff_factor * (2 ** (attempt - 1))
+                wait = max(0.1, wait) + random.uniform(0, 0.5)
+                log.warning(
+                    "POST %s returned %s; Retry-After=%s; retrying after %.1fs (attempt %d/%d)",
+                    url,
+                    resp.status_code,
+                    ra,
+                    wait,
+                    attempt,
+                    max_retries,
+                )
+                if attempt == max_retries:
+                    # Final attempt: raise a clear HTTPError including Retry-After when present
+                    try:
+                        reason = resp.reason
+                    except Exception:
+                        reason = ""
+                    msg = f"{resp.status_code} {reason}: {resp.text}"
+                    if ra:
+                        msg += f" (Retry-After: {ra})"
+                    raise requests.HTTPError(msg)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as e:
+            # Detect DNS / name resolution errors and fail fast with a clear message
+            estr = str(e)
+            if "NameResolutionError" in estr or "Failed to resolve" in estr or "getaddrinfo failed" in estr:
+                log.error("DNS resolution failed when contacting %s: %s", url, estr)
+                raise requests.ConnectionError(f"DNS resolution failed contacting {url}: {estr}")
+
+            # Attempt to surface any Retry-After or status info from the response if available
+            resp = getattr(e, "response", None)
+            ra = None
+            status = None
+            if resp is not None:
+                try:
+                    ra = resp.headers.get("Retry-After")
+                except Exception:
+                    ra = None
+                status = getattr(resp, "status_code", None)
+            if attempt == max_retries:
+                # Include Retry-After in final error when possible
+                if status or ra:
+                    parts = [str(status) if status else "", str(e)]
+                    if ra:
+                        parts.append(f"Retry-After: {ra}")
+                    raise requests.HTTPError("; ".join([p for p in parts if p]))
+                raise
+            wait = backoff_factor * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            log.warning("Request error to %s: %s; retrying in %.1fs (attempt %d/%d)", url, e, wait, attempt, max_retries)
+            time.sleep(wait)
+    raise RuntimeError("Retries exhausted for POST %s" % url)
+
+# --- JARVIS core: persistent memory, task queue, scheduling, news, sentiment, actions
+import json
+import urllib.request
+import xml.etree.ElementTree as ET
+
+
+class JarvisCore:
+    def __init__(self, base_dir: Path | None = None):
+        self.base = (Path(base_dir) if base_dir else Path(__file__).resolve().parent) / ".jarvis_data"
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.memory_path = self.base / "memory.json"
+        self.tasks_path = self.base / "tasks.json"
+        self.calendar_path = self.base / "calendar.json"
+        self._memory = self._load_json(self.memory_path) or {}
+        self._tasks = self._load_json(self.tasks_path) or []
+        self._calendar = self._load_json(self.calendar_path) or []
+        self._task_lock = threading.Lock()
+        self._pending_actions: dict[int, dict] = {}
+        self._pending_lock = threading.Lock()
+        self._start_scheduler_thread()
+
+    # Pending action confirmation (for risky actions)
+    def add_pending_action(self, action: dict) -> int:
+        with self._pending_lock:
+            aid = int(time.time() * 1000)
+            self._pending_actions[aid] = {"action": action, "ts": time.time()}
+            return aid
+
+    def confirm_pending_action(self, aid: int) -> dict | None:
+        with self._pending_lock:
+            act = self._pending_actions.pop(aid, None)
+        if not act:
+            return None
+        a = act.get("action")
+        if not a:
+            return None
+        if a.get("type") == "run_command":
+            return self.run_command(a.get("cmd"))
+        return None
+
+    def list_pending_actions(self) -> dict:
+        return dict(self._pending_actions)
+
+    def calendar_oauth_instructions(self) -> str:
+        return (
+            "To integrate Google Calendar: create OAuth credentials at https://console.developers.google.com, "
+            "set a redirect URI to http://localhost:PORT/callback, and set environment variables: "
+            "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET. Then implement an OAuth exchange to obtain tokens. "
+            "This helper only provides instructions; provide credentials and I can scaffold the OAuth flow."
+        )
+
+    # Google Calendar OAuth and API helpers
+    def _google_tokens_path(self) -> Path:
+        return self.base / "google_tokens.json"
+
+    def _load_google_tokens(self) -> dict | None:
+        return self._load_json(self._google_tokens_path())
+
+    def _save_google_tokens(self, obj: dict) -> None:
+        self._save_json(self._google_tokens_path(), obj)
+
+    def google_disconnect(self) -> bool:
+        p = self._google_tokens_path()
+        try:
+            if p.is_file():
+                p.unlink()
+            return True
+        except Exception:
+            return False
+
+    def _refresh_google_token(self, client_id: str, client_secret: str, tokens: dict) -> dict | None:
+        if not tokens or not tokens.get("refresh_token"):
+            return None
+        try:
+            data = {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "refresh_token",
+                "refresh_token": tokens.get("refresh_token"),
+            }
+            r = requests.post("https://oauth2.googleapis.com/token", data=data, timeout=10)
+            r.raise_for_status()
+            new = r.json()
+            # merge
+            tokens.update({k: v for k, v in new.items() if k in ("access_token", "expires_in", "scope", "token_type")})
+            tokens["expires_at"] = time.time() + int(new.get("expires_in", 0))
+            self._save_google_tokens(tokens)
+            return tokens
+        except Exception:
+            log.exception("Failed to refresh Google token")
+            return None
+
+    def _ensure_google_tokens(self) -> dict | None:
+        tokens = self._load_google_tokens()
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+        if not tokens:
+            return None
+        if tokens.get("expires_at") and tokens.get("expires_at") > time.time() + 30:
+            return tokens
+        # try refresh
+        if client_id and client_secret:
+            return self._refresh_google_token(client_id, client_secret, tokens)
+        return tokens
+
+    def google_start_oauth(self, host: str = "localhost", port: int = 8765, scope: str | None = None, timeout: int = 300) -> str:
+        """Start an OAuth flow to obtain Google Calendar tokens.
+        Returns a short status message; will open the browser for the user to consent.
+        """
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            return "Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET in environment."
+
+        scope = scope or "https://www.googleapis.com/auth/calendar.readonly"
+        redirect_path = "/oauth2callback"
+        redirect_uri = f"http://{host}:{port}{redirect_path}"
+        state = hashlib.sha256(f"{time.time()}-{client_id}".encode()).hexdigest()
+
+        auth_url = (
+            "https://accounts.google.com/o/oauth2/v2/auth?"
+            + urllib.parse.urlencode(
+                {
+                    "client_id": client_id,
+                    "response_type": "code",
+                    "scope": scope,
+                    "redirect_uri": redirect_uri,
+                    "access_type": "offline",
+                    "prompt": "consent",
+                    "state": state,
+                }
+            )
+        )
+
+        # start a local HTTP server to receive the code
+        code_box: dict = {"code": None}
+        received = threading.Event()
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                qs = urllib.parse.urlparse(self.path)
+                if qs.path != redirect_path:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                params = urllib.parse.parse_qs(qs.query)
+                code = params.get("code", [None])[0]
+                # respond
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"<html><body><h1>Authorization received. You can close this tab.</h1></body></html>")
+                code_box["code"] = code
+                received.set()
+
+            def log_message(self, format, *args):
+                return
+
+        server = http.server.ThreadingHTTPServer((host, port), _Handler)
+
+        def _serve():
+            try:
+                server.serve_forever()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_serve, daemon=True)
+        t.start()
+
+        try:
+            webbrowser.open(auth_url)
+        except Exception:
+            log.info("Open the following URL in your browser: %s", auth_url)
+
+        waited = received.wait(timeout)
+        server.shutdown()
+        if not waited:
+            return "Timed out waiting for authorization code."
+        code = code_box.get("code")
+        if not code:
+            return "No code received."
+
+        # exchange code
+        try:
+            data = {
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            }
+            r = requests.post("https://oauth2.googleapis.com/token", data=data, timeout=10)
+            r.raise_for_status()
+            tokens = r.json()
+            tokens["expires_at"] = time.time() + int(tokens.get("expires_in", 0))
+            self._save_google_tokens(tokens)
+            return "Google Calendar connected and tokens saved."
+        except Exception as e:
+            log.exception("Failed to exchange code for tokens")
+            return f"Token exchange failed: {e}"
+
+    def calendar_list_google_events(self, max_results: int = 10) -> list[str]:
+        tokens = self._ensure_google_tokens()
+        if not tokens or not tokens.get("access_token"):
+            return []
+        headers = {"Authorization": f"Bearer {tokens.get('access_token')}"}
+        now = datetime.utcnow().isoformat() + "Z"
+        params = {"timeMin": now, "maxResults": max_results, "orderBy": "startTime", "singleEvents": "true"}
+        try:
+            r = requests.get("https://www.googleapis.com/calendar/v3/calendars/primary/events", params=params, headers=headers, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+            items = j.get("items") or []
+            out = []
+            for it in items:
+                start = it.get("start", {}).get("dateTime") or it.get("start", {}).get("date")
+                summary = it.get("summary") or "(no title)"
+                out.append(f"{start} {summary}")
+            return out
+        except Exception:
+            log.exception("Failed to fetch Google Calendar events")
+            return []
+
+    def _load_json(self, p: Path):
+        try:
+            if p.is_file():
+                with p.open("r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            log.warning("Failed to read %s", p)
+        return None
+
+    def _save_json(self, p: Path, obj) -> None:
+        try:
+            with p.open("w", encoding="utf-8") as f:
+                json.dump(obj, f, indent=2, ensure_ascii=False)
+        except Exception:
+            log.exception("Failed to write %s", p)
+
+    # Memory API
+    def remember(self, key: str, value: str) -> None:
+        self._memory[key] = {"value": value, "ts": time.time()}
+        self._save_json(self.memory_path, self._memory)
+
+    def recall(self, key: str) -> str | None:
+        v = self._memory.get(key)
+        return v["value"] if v else None
+
+    def forget(self, key: str) -> bool:
+        if key in self._memory:
+            del self._memory[key]
+            self._save_json(self.memory_path, self._memory)
+            return True
+        return False
+
+    def list_memory(self) -> dict:
+        return {k: v["value"] for k, v in self._memory.items()}
+
+    # Tasks
+    def add_task(self, title: str, metadata: dict | None = None) -> int:
+        with self._task_lock:
+            tid = int(time.time() * 1000)
+            item = {"id": tid, "title": title, "meta": metadata or {}, "created": time.time(), "done": False}
+            self._tasks.append(item)
+            self._save_json(self.tasks_path, self._tasks)
+            return tid
+
+    def list_tasks(self) -> list:
+        return list(self._tasks)
+
+    def complete_task(self, tid: int) -> bool:
+        with self._task_lock:
+            for t in self._tasks:
+                if t.get("id") == tid:
+                    t["done"] = True
+                    self._save_json(self.tasks_path, self._tasks)
+                    return True
+        return False
+
+    # Calendar/scheduling
+    def schedule_event(self, ts_iso: str, title: str) -> bool:
+        try:
+            dt = datetime.fromisoformat(ts_iso)
+        except Exception:
+            return False
+        self._calendar.append({"when": dt.isoformat(), "title": title})
+        self._save_json(self.calendar_path, self._calendar)
+        return True
+
+    def list_events(self) -> list:
+        return list(self._calendar)
+
+    def _start_scheduler_thread(self) -> None:
+        def _runner():
+            while True:
+                try:
+                    now = datetime.now()
+                    to_run = []
+                    remaining = []
+                    for e in self._calendar:
+                        try:
+                            when = datetime.fromisoformat(e["when"])
+                            if when <= now:
+                                to_run.append(e)
+                            else:
+                                remaining.append(e)
+                        except Exception:
+                            remaining.append(e)
+                    if to_run:
+                        self._calendar = remaining
+                        self._save_json(self.calendar_path, self._calendar)
+                        for e in to_run:
+                            log.info("Scheduled event triggered: %s", e.get("title"))
+                    time.sleep(30)
+                except Exception:
+                    log.exception("Scheduler thread error")
+                    time.sleep(5)
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+
+    # News fetcher
+    def fetch_news(self, source: str | None = None, limit: int = 5) -> list[str]:
+        # default to BBC RSS for public headlines
+        url = source or "http://feeds.bbci.co.uk/news/rss.xml"
+        try:
+            with urllib.request.urlopen(url, timeout=6) as resp:
+                data = resp.read()
+            root = ET.fromstring(data)
+            items = root.findall('.//item')
+            headlines = []
+            for it in items[:limit]:
+                t = it.find('title')
+                if t is not None and t.text:
+                    headlines.append(t.text.strip())
+            return headlines
+        except Exception:
+            log.exception("News fetch failed")
+            return []
+    # Simple sentiment analysis (rule-based)
+    def sentiment(self, text: str) -> dict:
+        if not text:
+            return {"label": "neutral", "score": 0.0}
+        pos_words = {"good", "great", "happy", "love", "excellent", "awesome", "fantastic", "positive", "nice", "best"}
+        neg_words = {"bad", "sad", "hate", "terrible", "awful", "poor", "negative", "angry", "worse", "worst"}
+        t = text.lower()
+        score = 0
+        for w in pos_words:
+            if w in t:
+                score += 1
+        for w in neg_words:
+            if w in t:
+                score -= 1
+        label = "positive" if score > 0 else "negative" if score < 0 else "neutral"
+        return {"label": label, "score": float(score)}
+
+    def run_command(self, cmd: str, timeout: int = 10) -> dict:
+        try:
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            return {"rc": p.returncode, "stdout": p.stdout, "stderr": p.stderr}
+        except Exception as e:
+            return {"rc": -1, "stdout": "", "stderr": str(e)}
+        # Note: LLM call logic was removed from here; `run_command` only executes shell commands.
+
+
+def open_path(path: str) -> str:
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        return f"Path does not exist: {path}"
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return f"Opened {path}."
+    except Exception as e:
+        return f"Unable to open path: {e}"
+
+
+def take_screenshot() -> str:
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        return "Screenshot unavailable: install Pillow to enable screenshots."
+
+    screenshot_dir = Path(Path(__file__).resolve().parent / ".cache" / "jarvis_screenshots")
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
+    path = screenshot_dir / f"screenshot-{int(time.time())}.png"
+    try:
+        ImageGrab.grab().save(path)
+        return f"Saved screenshot to {path}"
+    except Exception as e:
+        return f"Screenshot capture failed: {e}"
+
+
+def llm_reason(prompt: str, timeout: int = 20) -> str:
+    """Ask a configured LLM to reason about `prompt`.
+
+    Provider selection (environment variables):
+      - `LLM_PROVIDER=OLLAMA` to use a local Ollama installation via the `ollama` CLI.
+      - `LLM_PROVIDER=OLLAMA_HTTP` to use a local Ollama HTTP server (set `OLLAMA_HTTP_URL`).
+      - default: GROQ via `GROQ_API_KEY` / `XAI_API_KEY`.
+    """
+    provider = (os.getenv("LLM_PROVIDER") or "").upper()
+
+    # Ollama CLI provider
+    if provider == "OLLAMA":
+        model = os.getenv("OLLAMA_MODEL") or "llama2"
+        try:
+            proc = subprocess.run(
+                ["ollama", "run", model],
+                input=prompt.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+            if proc.returncode != 0:
+                serr = proc.stderr.decode(errors="replace")
+                return f"Ollama CLI error: {serr.strip() or proc.returncode}"
+            return proc.stdout.decode(errors="replace").strip()
+        except FileNotFoundError:
+            return "Ollama CLI not found: install Ollama and ensure `ollama` is on PATH."
+        except subprocess.TimeoutExpired:
+            return "Ollama CLI timed out while generating a response."
+        except Exception as e:
+            return f"Ollama CLI error: {e}"
+
+    # Ollama HTTP provider (local server)
+    if provider == "OLLAMA_HTTP":
+        ollama_url = os.getenv("OLLAMA_HTTP_URL") or "http://127.0.0.1:11434/v1/generate"
+        model = os.getenv("OLLAMA_MODEL") or "llama2"
+        try:
+            payload = {"model": model, "prompt": prompt}
+            r = requests.post(ollama_url, json=payload, timeout=timeout)
+            r.raise_for_status()
+            j = r.json()
+            return j.get("text") or j.get("result") or str(j)
+        except requests.RequestException as e:
+            estr = str(e)
+            if "Failed to establish a new connection" in estr or "Connection refused" in estr:
+                return (
+                    f"Ollama HTTP server unreachable at {ollama_url}. Start the Ollama server or check the URL."
+                )
+            return f"Ollama HTTP request failed: {e}"
+
+    # Prefer GROQ/XAI if configured (do not use OpenAI)
+    # This branch intentionally avoids contacting OpenAI even if OPENAI_API_KEY is present.
+
+    # Default: GROQ-compatible endpoint
+    groq_key = os.getenv("GROQ_API_KEY") or os.getenv("XAI_API_KEY")
+    if not groq_key:
+        return "No LLM configured: set GROQ_API_KEY, XAI_API_KEY, OPENAI_API_KEY, or set LLM_PROVIDER=OLLAMA for local Ollama."
+    groq_url = "https://api.groq.x.ai/v1"
+    try:
+        headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+        resp = _post_with_retries(groq_url, json={"prompt": prompt}, headers=headers, timeout=timeout)
+        j = resp.json()
+        return j.get("text") or j.get("result") or j.get("output") or str(j)
+    except Exception as e:
+        estr = str(e)
+        if "NameResolutionError" in estr or "Failed to resolve" in estr or "getaddrinfo failed" in estr:
+            return (
+                "Groq request failed: DNS resolution error contacting api.groq.x.ai. "
+                "Check your network, DNS settings, VPN, or hosts file, and try again."
+            )
+        return f"Groq request failed: {e}"
+
+
+def llm_test_key(timeout: int = 20) -> str:
+    groq_key = os.getenv("GROQ_API_KEY") or os.getenv("XAI_API_KEY")
+    if not groq_key:
+        return "No LLM API key configured. Set GROQ_API_KEY (or XAI_API_KEY)."
+    groq_url = "https://api.groq.x.ai/v1"
+    try:
+        headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+        resp = _post_with_retries(groq_url, json={"prompt": "Say hello"}, headers=headers, timeout=timeout)
+        return "Groq key is valid and the endpoint responded successfully."
+    except Exception as e:
+        estr = str(e)
+        if "NameResolutionError" in estr or "Failed to resolve" in estr or "getaddrinfo failed" in estr:
+            return (
+                "Groq key test failed: DNS resolution error contacting api.groq.x.ai. "
+                "Check your network, DNS, VPN, or hosts file."
+            )
+        return f"Groq key test failed: {e}"
+
+
+# Global Jarvis core instance
+JARVIS_CORE = JarvisCore()
 
 
 def block_samples() -> int:
@@ -135,6 +709,20 @@ def _input_devices() -> list[tuple[int, dict]]:
         for i, dev in enumerate(sd.query_devices())
         if dev["max_input_channels"] >= 1
     ]
+
+
+def format_input_devices() -> str:
+    """Return a formatted string listing available input audio devices."""
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        return f"Could not query audio devices: {e}"
+    lines = []
+    default_idx = sd.default.device[0] if sd.default and sd.default.device else None
+    for i, dev in enumerate(devices):
+        mark = "<default>" if default_idx is not None and i == default_idx else ""
+        lines.append(f"{i:3d}: {dev.get('name')} (inputs={dev.get('max_input_channels')}) {mark}")
+    return "\n".join(lines)
 
 
 def _resolve_input_device_index(spec: str) -> int:
@@ -325,10 +913,10 @@ def _save_pcm_wav_file(path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
         raise
 
 
-def say_jarvis_welcome() -> None:
-    if not JARVIS_WELCOME_ENABLED or not JARVIS_WELCOME_PHRASE.strip():
+def say_text(text: str) -> None:
+    text = (text or "").strip()
+    if not text:
         return
-    text = JARVIS_WELCOME_PHRASE.strip()
     vid, model_id, output_format, pcm_rate = elevenlabs_env_config()
     if not vid:
         log.warning("Set ELEVENLABS_VOICE_ID in the environment for ElevenLabs TTS.")
@@ -336,7 +924,7 @@ def say_jarvis_welcome() -> None:
 
     cache_path = _jarvis_welcome_cache_path(text, vid, model_id, output_format)
     if JARVIS_WELCOME_CACHE_ENABLED and cache_path.is_file():
-        log.info("Playing welcome from cache: %s", cache_path)
+        log.info("Playing cached audio for text: %s", text)
         if _play_pcm_wav_file(cache_path):
             return
         log.warning("Cache miss after read failure; fetching from ElevenLabs.")
@@ -368,7 +956,7 @@ def say_jarvis_welcome() -> None:
     if JARVIS_WELCOME_CACHE_ENABLED:
         try:
             _save_pcm_wav_file(cache_path, raw, pcm_rate)
-            log.info("Saved welcome audio to cache: %s", cache_path)
+            log.info("Saved generated audio to cache: %s", cache_path)
         except OSError as e:
             log.warning("Could not save welcome cache: %s", e)
     pcm_i16 = np.frombuffer(raw, dtype=np.int16)
@@ -380,17 +968,57 @@ def say_jarvis_welcome() -> None:
         log.warning("Could not play ElevenLabs audio: %s", e)
 
 
+def say_jarvis_welcome() -> None:
+    if not JARVIS_WELCOME_ENABLED or not JARVIS_WELCOME_PHRASE.strip():
+        return
+    say_text(JARVIS_WELCOME_PHRASE.strip())
+
+
+def open_url_default_browser(url: str) -> None:
+    u = url.strip()
+    if not u:
+        return
+    try:
+        webbrowser.open_new_tab(u)
+    except OSError as e:
+        log.warning("Could not open URL in default browser: %s", e)
+
+
 def play_song(uri: str) -> None:
     u = uri.strip()
     if not u:
         return
     try:
-        if sys.platform == "win32":
-            os.startfile(u)
+        if u.lower().startswith("spotify:"):
+            if sys.platform == "win32":
+                os.startfile(u)
+            else:
+                open_url_default_browser(u)
+        elif u.lower().startswith(("http://", "https://")):
+            open_url_default_browser(u)
         else:
-            webbrowser.open(u)
+            if sys.platform == "win32":
+                os.startfile(u)
+            else:
+                open_url_default_browser(u)
     except OSError as e:
         log.warning("Could not open SONG_URI: %s", e)
+
+
+def open_search_in_default_browser(query: str) -> None:
+    q = (query or "").strip()
+    if not q:
+        return
+    url = f"https://www.google.com/search?q={urllib.parse.quote(q)}"
+    log.info("Opening search in default browser: %s", url)
+    open_url_default_browser(url)
+
+
+def open_claude_in_default_browser() -> None:
+    query = (os.environ.get("CLAUDE_CODE_SEARCH") or "claude code").strip()
+    if not query:
+        return
+    open_search_in_default_browser(query)
 
 
 def _chrome_executable() -> str | None:
@@ -684,6 +1312,272 @@ def _open_url_in_chrome(
         log.warning("Could not open %s in Chrome: %s", label, e)
 
 
+def ai_agent_response(prompt: str) -> str:
+    prompt = (prompt or "").strip()
+    lower = prompt.lower()
+    if not lower:
+        return "I am here and ready to assist. Please tell me what you need."
+
+    if any(term in lower for term in ("exit", "quit", "bye", "stop")):
+        return "Goodbye. I am standing by when you need me next."
+
+    if any(term in lower for term in ("how are you", "how have you")) or lower.startswith(("hi", "hello", "hey jarvis", "jarvis")):
+        return "I am operational and ready. I can listen, think, open Claude search, play Spotify, and speak back to you."
+
+    # LLM-backed reasoning: preferring Groq if GROQ_API_KEY present
+    m = re.match(r"(?:reason about|reason:|--reason)\s+(.+)", prompt, re.IGNORECASE)
+    if m:
+        question = m.group(1).strip()
+        return llm_reason(question)
+
+    if "play" in lower and ("spotify" in lower or "song" in lower or "music" in lower):
+        play_song(SONG_URI)
+        return "Starting Spotify playback now."
+
+    if "open" in lower and "claude" in lower:
+        open_claude_in_default_browser()
+        return "Opening Claude code search in your default browser."
+
+    if "search" in lower and "claude" in lower:
+        open_claude_in_default_browser()
+        return "Searching for Claude code in your default browser."
+
+    if "open" in lower and "browser" in lower:
+        open_search_in_default_browser("Claude code")
+        return "Opening your default browser to search for Claude code."
+
+    if "analyze" in lower or "analysis" in lower or "summarize" in lower or "review" in lower:
+        return "I can analyze your request and offer next steps. Tell me what you want reviewed or summarized."
+
+    if "think" in lower or "agent" in lower or "reason" in lower:
+        return "I am thinking through your request. Give me a specific task or topic and I will respond with an answer."
+
+    if "help" in lower or "can you" in lower or "what can you do" in lower:
+        return (
+            "I can reply, analyze, think, and act. Say commands like 'play music', 'open Claude', "
+            "or 'search Claude code' and I will do it in your default browser."
+        )
+
+    if "device info" in lower or "system info" in lower:
+        return get_system_info()
+
+    if (
+        "list input devices" in lower
+        or "list microphones" in lower
+        or "list mic" in lower
+        or "audio devices" in lower
+    ):
+        return format_input_devices()
+
+    match = re.search(r"(?i)(?:open|show|browse) (?:path|folder|file) (.+)", prompt)
+    if match:
+        return open_path(match.group(1).strip())
+
+    if "read clipboard" in lower or "clipboard read" in lower or "show clipboard" in lower:
+        return _read_clipboard()
+
+    match = re.search(r"(?i)(?:write|copy|set) clipboard(?: to)?[: ]+(.+)", prompt)
+    if match:
+        return _write_clipboard(match.group(1).strip())
+
+    if "screenshot" in lower or "take screenshot" in lower:
+        return take_screenshot()
+
+    if "spotify" in lower or "song" in lower or "music" in lower:
+        if "search" in lower or "find" in lower:
+            open_search_in_default_browser("spotify music")
+            return "Searching for Spotify music in your default browser."
+        if "play" in lower:
+            play_song(SONG_URI)
+            return "Playing your configured Spotify track now."
+
+    match = re.search(r"search for (.+)", lower)
+    if match:
+        query = match.group(1).strip()
+        open_search_in_default_browser(query)
+        return f"Searching for {query} in your default browser."
+
+    if "default" in lower and "browser" in lower:
+        open_search_in_default_browser("Claude code")
+        return "Opening your default browser."
+
+    # Run shell/OS command (safe mode: require confirmation)
+    m = re.match(r"run command[: ]+(.+)", lower)
+    if m:
+        cmd = m.group(1).strip()
+        aid = JARVIS_CORE.add_pending_action({"type": "run_command", "cmd": cmd})
+        return f"Command queued as id={aid}. Reply 'confirm run {aid}' to execute."
+
+    m = re.match(r"confirm run\s+(\d+)", lower)
+    if m:
+        aid = int(m.group(1))
+        res = JARVIS_CORE.confirm_pending_action(aid)
+        if not res:
+            return "No pending action by that id."
+        out = res.get("stdout") or res.get("stderr") or ""
+        return f"Executed. rc={res.get('rc')}. output: {out[:800]}"
+
+    # Fallback to any configured LLM for general queries (GROQ/XAI or local Ollama).
+    if os.getenv("GROQ_API_KEY") or os.getenv("XAI_API_KEY") or os.getenv("LLM_PROVIDER"):
+        return llm_reason(prompt)
+
+    if re.match(r"(?:test groq key|test llm key|test api key)$", lower, re.IGNORECASE):
+        return llm_test_key()
+
+    return (
+        "I can handle specific actions like opening Claude, playing music, or managing tasks. "
+        "For general questions, set GROQ_API_KEY (or XAI_API_KEY) in your environment, "
+        "then ask again or use 'reason about <question>'."
+    )
+
+
+def start_agent_interface() -> None:
+    if not JARVIS_AGENT_ENABLED or not sys.stdin or not sys.stdin.isatty():
+        return
+
+    def _agent_loop() -> None:
+        print("\nJarvis agent mode is active. Type a command and press Enter.")
+        while True:
+            try:
+                prompt = input("You: ")
+            except (KeyboardInterrupt, EOFError):
+                print("\nJarvis: Agent mode ended.")
+                break
+            prompt = prompt.strip()
+            if not prompt:
+                continue
+            response = ai_agent_response(prompt)
+            print(f"Jarvis: {response}")
+            if JARVIS_WELCOME_ENABLED:
+                threading.Thread(target=say_text, args=(response,), daemon=True).start()
+            if prompt.lower() in ("exit", "quit", "bye", "stop"):
+                break
+
+    threading.Thread(target=_agent_loop, daemon=True).start()
+
+
+def _record_until_silence(max_duration_s: float = JARVIS_VOICE_COMMAND_MAX_S) -> bytes | None:
+    blocksize = int(round(SAMPLE_RATE * JARVIS_VOICE_COMMAND_BLOCK_MS / 1000))
+    max_blocks = max(1, int(round(max_duration_s * SAMPLE_RATE / blocksize)))
+    silence_blocks_needed = max(1, int(round(JARVIS_VOICE_COMMAND_END_S * SAMPLE_RATE / blocksize)))
+    collected: list[np.ndarray] = []
+    in_speech = False
+    silence_blocks = 0
+    try:
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            blocksize=blocksize,
+        ) as stream:
+            for _ in range(max_blocks):
+                data, overflowed = stream.read(blocksize)
+                if overflowed:
+                    log.warning("Voice capture input overflow detected.")
+                level = rms_mono(data)
+                if in_speech:
+                    collected.append(data.copy())
+                    if level < JARVIS_VOICE_COMMAND_SILENCE_THRESHOLD:
+                        silence_blocks += 1
+                        if silence_blocks >= silence_blocks_needed:
+                            break
+                    else:
+                        silence_blocks = 0
+                elif level >= JARVIS_VOICE_COMMAND_SILENCE_THRESHOLD:
+                    in_speech = True
+                    collected.append(data.copy())
+                    silence_blocks = 0
+            if not collected:
+                return None
+            audio = np.concatenate(collected, axis=0)
+            if audio.ndim > 1:
+                audio = np.mean(audio, axis=1)
+            pcm_i16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+            return pcm_i16.tobytes()
+    except Exception as e:
+        log.warning("Voice recording failed: %s", e)
+        return None
+
+
+def start_voice_agent() -> None:
+    if not JARVIS_VOICE_AGENT_ENABLED:
+        return
+    try:
+        import speech_recognition as sr
+    except ImportError:
+        log.warning(
+            "SpeechRecognition is not installed. Install it with `pip install SpeechRecognition` to use voice commands."
+        )
+        return
+
+    recognizer = sr.Recognizer()
+    print("\nJarvis voice mode is active. Speak a command after the prompt.")
+    while True:
+        try:
+            print("Jarvis is listening for a voice command...")
+            audio_bytes = _record_until_silence()
+            if audio_bytes is None:
+                print("Jarvis: I did not hear a command. Please speak again.")
+                time.sleep(0.5)
+                continue
+            audio = sr.AudioData(audio_bytes, SAMPLE_RATE, 2)
+            try:
+                phrase = recognizer.recognize_google(audio)
+                phrase = phrase.strip()
+                if not phrase:
+                    print("Jarvis: I did not catch that. Please try again.")
+                    continue
+                print(f"You said: {phrase}")
+                response = ai_agent_response(phrase)
+                print(f"Jarvis: {response}")
+                if JARVIS_WELCOME_ENABLED:
+                    threading.Thread(target=say_text, args=(response,), daemon=True).start()
+                if phrase.lower() in ("exit", "quit", "bye", "stop"):
+                    print("Jarvis: Voice agent stopped.")
+                    break
+            except sr.UnknownValueError:
+                print("Jarvis: Sorry, I could not understand that. Please speak clearly.")
+            except sr.RequestError as e:
+                print(f"Jarvis: Speech recognition failed (network or service issue): {e}")
+                time.sleep(5.0)
+        except KeyboardInterrupt:
+            print("\nJarvis: Voice agent ended.")
+            break
+
+
+WAKEWORD_STOP = None
+
+
+def start_wakeword_listener() -> None:
+    """Start a background wake-word listener that launches the voice agent on keyword."""
+    global WAKEWORD_STOP
+    if not JARVIS_WAKEWORD_ENABLED:
+        log.info("Wakeword listener disabled (JARVIS_WAKEWORD_ENABLED=False)")
+        return
+    try:
+        recognizer = sr.Recognizer()
+        mic = sr.Microphone()
+    except Exception as e:
+        log.warning("Could not initialize wakeword listener: %s", e)
+        return
+
+    def _callback(recognizer, audio):
+        try:
+            text = recognizer.recognize_google(audio)
+            if JARVIS_WAKEWORD.lower() in text.lower():
+                log.info("Wakeword detected: %s", text)
+                # Launch a short-lived voice agent to collect a command
+                threading.Thread(target=start_voice_agent, daemon=True).start()
+        except Exception:
+            pass
+
+    try:
+        WAKEWORD_STOP = recognizer.listen_in_background(mic, _callback)
+        log.info("Wakeword listener started")
+    except Exception as e:
+        log.warning("Failed to start wakeword background listener: %s", e)
+
+
 def open_claude_in_chrome() -> None:
     if not OPEN_CLAUDE_CODE_IN_CHROME:
         return
@@ -722,7 +1616,8 @@ def open_binance_btc_in_chrome() -> None:
     if not OPEN_BINANCE_BTC_IN_CHROME:
         return
     url = (
-        os.environ.get("BINANCE_BTC_URL")
+        os.environ.get("TASARADAR_URL")
+        or os.environ.get("BINANCE_BTC_URL")
         or "https://www.binance.com/en/trade/BTC_USDT"
     ).strip()
     pos: tuple[int, int] | None = None
@@ -865,13 +1760,13 @@ def _focus_existing_cursor_window_win32() -> bool:
 def run_double_clap_actions() -> None:
     """Run outside the mic loop so sleeps do not stall capture."""
     play_song(SONG_URI)
-    open_claude_in_chrome()
-    open_binance_btc_in_chrome()
     if JARVIS_WELCOME_ENABLED and JARVIS_WELCOME_PHRASE.strip():
-        delay = max(0.0, JARVIS_AFTER_SONG_DELAY_S)
-        if delay:
-            time.sleep(delay)
-        threading.Thread(target=say_jarvis_welcome, daemon=True).start()
+        def _delayed_welcome() -> None:
+            time.sleep(max(0.0, JARVIS_AFTER_SONG_DELAY_S))
+            say_jarvis_welcome()
+
+        threading.Thread(target=_delayed_welcome, daemon=True).start()
+    open_claude_in_default_browser()
     open_cursor_window()
 
 
@@ -973,6 +1868,14 @@ def main() -> int:
             ef,
             er,
         )
+
+    if JARVIS_AGENT_ENABLED:
+        log.info("Jarvis agent mode is active. Type a command and press Enter.")
+        start_agent_interface()
+
+    if JARVIS_VOICE_AGENT_ENABLED:
+        log.info("Jarvis voice agent is enabled. Listening for spoken commands.")
+        threading.Thread(target=start_voice_agent, daemon=True).start()
 
     input_idx = _choose_input_device(blocksize)
 

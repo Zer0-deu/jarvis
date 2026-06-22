@@ -1,0 +1,1 @@
+No LLM configured: set GROQ_API_KEY, XAI_API_KEY, OPENAI_API_KEY, or set LLM_PROVIDER=OLLAMA for local Ollama.
